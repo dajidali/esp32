@@ -1,0 +1,261 @@
+#include <WiFi.h>
+#include <time.h>
+
+// ===================== 【全新安全同侧引脚，无Boot Strapping】 =====================
+// 水泵1：IN1=GPIO5, IN2=GPIO6
+#define P1_IN1     5
+#define P1_IN2     6
+// 水泵2：IN3=GPIO10, IN4=GPIO20
+#define P2_IN3     10
+#define P2_IN4     20
+
+// WiFi NTP配置
+const char* ssid     = "xxxx";
+const char* password = "xxxx";
+const char* ntpServer = "ntp.aliyun.com";
+const long  gmtOffset_sec = 8 * 3600;  // 北京时间东八区
+const int   daylightOffset_sec = 0;
+
+// ==========【正式工作时序】==========
+const unsigned long PUMP_RUN_TIME    = 2UL * 60 * 1000;   // 泵运行4分钟
+const unsigned long GAP_TIME         = 1UL * 60 * 1000;   // 泵1停止后等待1分钟间隙
+
+// NTP重试参数
+const int MAX_RETRY_ONCE = 10;                  // 单次最多尝试10次联网
+const unsigned long RETRY_INTERVAL_FAIL = 60UL * 60 * 1000; // 失败后间隔1小时再试
+
+// 状态机变量
+enum State {
+  WAIT_TRIGGER,    // 等待整点/半点触发
+  RUN_PUMP1,
+  WAIT_GAP,
+  RUN_PUMP2
+};
+State currentState = WAIT_TRIGGER;
+unsigned long stateStartMs = 0;
+
+bool hasSyncedToday = false;
+bool timeIsValid = false;           // 标记：是否成功获取过NTP时间
+unsigned long lastRetryTime = 0;    // 上次NTP重试的时间戳
+bool cycleTriggered = false;        // 标记本轮整点/半点已经触发，防止重复触发
+
+// ========== 电机控制函数 HH停机 ==========
+void pump1_Start(){
+  digitalWrite(P1_IN1, LOW);
+  digitalWrite(P1_IN2, HIGH);
+}
+void pump1_Stop(){
+  digitalWrite(P1_IN1, HIGH);
+  digitalWrite(P1_IN2, HIGH);
+}
+
+void pump2_Start(){
+  digitalWrite(P2_IN3, LOW);
+  digitalWrite(P2_IN4, HIGH);
+}
+void pump2_Stop(){
+  digitalWrite(P2_IN3, HIGH);
+  digitalWrite(P2_IN4, HIGH);
+}
+
+// 打印当前完整时间，同时返回小时分钟，增加合法性校验
+bool getAndPrintTime(int &hour, int &minute)
+{
+  struct tm timeinfo;
+  if(getLocalTime(&timeinfo)){
+    hour = timeinfo.tm_hour;
+    minute = timeinfo.tm_min;
+    Serial.printf("【当前时间】%04d-%02d-%02d %02d:%02d:%02d\n",
+                  timeinfo.tm_year+1900, timeinfo.tm_mon+1, timeinfo.tm_mday,
+                  timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+    return true;
+  }else{
+    Serial.println("【时间读取失败！】锁定水泵，禁止运行");
+    hour = -99;
+    minute = -99;
+    return false;
+  }
+}
+
+// NTP同步函数：最多重试MAX_RETRY_ONCE次
+bool syncNTPWithRetry()
+{
+  Serial.println("===== 开始尝试NTP时间同步 =====");
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_STA);
+  delay(200);
+
+  int tryCount = 0;
+  while(tryCount < MAX_RETRY_ONCE)
+  {
+    Serial.printf("尝试连接WiFi (%d/%d)\n", tryCount+1, MAX_RETRY_ONCE);
+    WiFi.begin(ssid, password);
+    int waitCnt = 0;
+    while(WiFi.status() != WL_CONNECTED && waitCnt < 40){
+      delay(250);
+      waitCnt++;
+    }
+    if(WiFi.status() == WL_CONNECTED){
+      configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+      delay(800);
+      struct tm tmpTime;
+      if(getLocalTime(&tmpTime)){
+        Serial.println("【NTP】北京时间同步成功！");
+        Serial.printf("同步后时间：%04d-%02d-%02d %02d:%02d:%02d\n",
+                  tmpTime.tm_year+1900, tmpTime.tm_mon+1, tmpTime.tm_mday,
+                  tmpTime.tm_hour, tmpTime.tm_min, tmpTime.tm_sec);
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+        return true;
+      }
+    }
+    Serial.println("本次连接失败，准备下一次重试");
+    tryCount++;
+    WiFi.disconnect();
+    delay(500);
+  }
+  Serial.printf("【NTP】%d次全部失败，关闭WiFi\n",MAX_RETRY_ONCE);
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  return false;
+}
+
+// 判断新一天，重置校时标记
+void checkNewDay()
+{
+  static int lastDay = -1;
+  struct tm timeinfo;
+  if(!getLocalTime(&timeinfo)) return;
+  int today = timeinfo.tm_mday;
+  if(today != lastDay){
+    lastDay = today;
+    hasSyncedToday = false;
+    currentState = WAIT_TRIGGER;
+    cycleTriggered = false;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // 关键：上电先输出HH高电平停机，再设置为输出，彻底消除上电毛刺
+  digitalWrite(P1_IN1, HIGH);
+  digitalWrite(P1_IN2, HIGH);
+  digitalWrite(P2_IN3, HIGH);
+  digitalWrite(P2_IN4, HIGH);
+
+  pinMode(P1_IN1, OUTPUT);
+  pinMode(P1_IN2, OUTPUT);
+  pinMode(P2_IN3, OUTPUT);
+  pinMode(P2_IN4, OUTPUT);
+
+  pump1_Stop();
+  pump2_Stop();
+  stateStartMs = millis();
+  lastRetryTime = millis();
+
+  Serial.println("===== 系统上电 =====");
+  bool syncResult = syncNTPWithRetry();
+  if(syncResult){
+    timeIsValid = true;
+  }
+}
+
+void loop() {
+  checkNewDay();
+  unsigned long nowMs = millis();
+
+  int h, m;
+  bool timeOK = getAndPrintTime(h, m);
+
+  // 时间读取异常：全部水泵停机，直接返回
+  if(!timeOK){
+    pump1_Stop();
+    pump2_Stop();
+    currentState = WAIT_TRIGGER;
+    cycleTriggered = false;
+    delay(2000);
+    return;
+  }
+
+  // 1. 每日凌晨1点，执行一次NTP校时
+  if(!hasSyncedToday && h == 1 && m == 0){
+    Serial.println("【定时任务】凌晨1点触发NTP校时");
+    bool ret = syncNTPWithRetry();
+    if(ret){
+      timeIsValid = true;
+      hasSyncedToday = true;
+    }
+    lastRetryTime = nowMs;
+  }
+
+  // 2. 如果还没成功同步过时间：每间隔1小时，重试一轮（最多10次）
+  if(!timeIsValid){
+    if(nowMs - lastRetryTime >= RETRY_INTERVAL_FAIL){
+      Serial.println("【重试】距离上次失败满1小时，重新尝试NTP");
+      bool ret = syncNTPWithRetry();
+      if(ret){
+        timeIsValid = true;
+      }
+      lastRetryTime = nowMs;
+    }
+  }
+
+  // 不在6:00~20:00时间段，全部停机，等待
+  if( h <6 || h >=20 ){
+    pump1_Stop();
+    pump2_Stop();
+    currentState = WAIT_TRIGGER;
+    cycleTriggered = false;
+    delay(2000);
+    return;
+  }
+
+  // ============ 6:00 ~ 20:00 整点半点触发状态机 ============
+  unsigned long elapsed = nowMs - stateStartMs;
+  switch(currentState){
+    case WAIT_TRIGGER:
+      pump1_Stop();
+      pump2_Stop();
+      // 整点或者半点，并且本轮还没有触发
+      if( (m ==0 || m ==30) && (!cycleTriggered) ){
+        Serial.println("【触发】整点/半点，启动本轮循环：泵1开始运行");
+        currentState = RUN_PUMP1;
+        stateStartMs = nowMs;
+        pump1_Start();
+        cycleTriggered = true;
+      }
+      // 分钟离开0/30，解除标记，允许下一次整点半点触发
+      if(m !=0 && m !=30){
+        cycleTriggered = false;
+      }
+      break;
+
+    case RUN_PUMP1:
+      if(elapsed >= PUMP_RUN_TIME){
+        pump1_Stop();
+        Serial.println("泵1停止，等待1分钟间隙");
+        currentState = WAIT_GAP;
+        stateStartMs = nowMs;
+      }
+      break;
+
+    case WAIT_GAP:
+      if(elapsed >= GAP_TIME){
+        Serial.println("间隙结束，启动泵2");
+        currentState = RUN_PUMP2;
+        stateStartMs = nowMs;
+        pump2_Start();
+      }
+      break;
+
+    case RUN_PUMP2:
+      if(elapsed >= PUMP_RUN_TIME){
+        pump2_Stop();
+        Serial.println("泵2停止，本轮循环结束，等待下一个整点/半点");
+        currentState = WAIT_TRIGGER;
+      }
+      break;
+  }
+  delay(2000);
+}
